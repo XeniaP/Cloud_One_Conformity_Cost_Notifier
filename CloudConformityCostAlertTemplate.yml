@@ -1,0 +1,124 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  CloudOneApiKey:
+    Type: String
+  Email:
+    Type: String
+Resources:
+  CloudOneApiKeyConformity:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "CloudOneApiKeyConformity"
+      Type: "String"
+      Value: !Sub "${CloudOneApiKey}"
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "Cloud-One-Pricing-Notification"
+  SNSEmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref SNSTopic
+      Endpoint: !Sub "${Email}"
+  ScheduleRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: "ConformityLambdaScheduleRule"
+      Description: "Regla que se ejecuta todos los días a las 10:00 am UTC"
+      ScheduleExpression: "cron(0 10 * * ? *)"
+      State: "ENABLED"
+  CloudOnePricingLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+          import json
+
+          def lambda_handler(event, context):
+            try:
+              url = 'https://us-west-2-api.cloudconformity.com/v1/accounts'
+              payload = "{}"
+              client = boto3.client('sns')
+              session = boto3.Session(region_name=os.environ['AWS_REGION'])
+              ssm = session.client('ssm')
+              apikey = ssm.get_parameter(Name='CloudOneApiKeyConformity', WithDecryption=True)['Parameter']['Value']
+              headers = {
+                "Content-Type": "application/vnd.api+json",
+                "Authorization": "ApiKey {}".format(apikey)
+              }
+              request = Request(url, method="GET", headers=headers)
+              accounts = json.loads(urlopen(request).read().decode())["data"]
+              message = 'Este es el estado de licenciamiento de las cuentas que tienes actualmente monitoreadas con Cloud One Conformity: \n {} \n'.format(listAccounts(accounts))
+              
+              infoPricing = "\n\nLista de Precios, pago por Consumo AWS Marketplace: \n https://aws.amazon.com/marketplace/pp/prodview-g232pyu6l55l4?sr=0-2&ref_=beagle&applicationId=AWSMPContessa\n\n Calculadora de Consumo: \n https://www.trendmicro.com/en_us/business/products/hybrid-cloud/aws/pricing.html?utm_campaign=TPL&utm_medium=MPPI&utm_source=AWS"
+              
+              response = client.publish(
+                TopicArn=os.environ["SNS_Topic"],
+                Message= message+infoPricing,
+                Subject='Cloud One - Actualizacion de Licenciamiento',
+              )
+            except Exception as e :
+              print("Error Main:", e)
+            
+          def listAccounts(accounts):
+            listAccountsInfo = "Name,\t # Resources,\t Tier"
+            for account in accounts:
+                try:
+                  if(int(account["attributes"]["resources-count"]) < 250):
+                    Tier="Free"
+                  elif(int(account["attributes"]["resources-count"]) > 249 and int(account["attributes"]["resources-count"]) < 1000):
+                    Tier="Small"
+                  elif(int(account["attributes"]["resources-count"]) > 999 and int(account["attributes"]["resources-count"]) < 5000):
+                    Tier="Medium"
+                  else:
+                    Tier="Large"
+                  listAccountsInfo += "\n"+str(account["attributes"]["name"])+",\t"+str(account["attributes"]["resources-count"])+",\t"+Tier
+                except Exception as e :
+                  print("Error Accounts:", e)
+                  pass
+            return listAccountsInfo
+      Handler: "index.lambda_handler"
+      Role: !GetAtt CloudOnePricingLambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_Topic: !Ref SNSTopic
+      Runtime: "python3.9"
+      Timeout: 10
+  CloudOnePricingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: CloudOnePricingLambdaRole
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+            - "sns:Publish"
+            Resource: !Ref 'SNSTopic'
+          - Effect: "Allow"
+            Action:
+            - "ssm:GetParameter"
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${CloudOneApiKeyConformity}'
